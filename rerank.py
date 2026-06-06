@@ -10,9 +10,13 @@ Use cross-encoder/ms-marco-MiniLM-L-6-v2 from sentence-transformers.
 
 from __future__ import annotations
 
+import json
+import os
+import time
+
 import numpy as np
 import weaviate
-from sentence_transformers import CrossEncoder
+from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from retrieval_helpers import hybrid_search
 
@@ -73,17 +77,146 @@ def rerank_search(
     if not candidate_ids:
         return []
 
-    # Stage 2: resolve each doc_id back to {"doc_id": ..., "text": ...} via Weaviate
+    # Stage 2: resolve each doc_id back to {"doc_id": ..., "text": ...} via Weaviate v3 API
     candidates = []
-    collection = client.collections.get("Document")
-
     for doc_id in candidate_ids:
-        result = collection.query.fetch_object_by_id(doc_id)
-        if result is not None:
+        res = (
+            client.query
+            .get("Post", ["doc_id", "text"])
+            .with_where({
+                "path": ["doc_id"],
+                "operator": "Equal",
+                "valueText": doc_id,
+            })
+            .with_limit(1)
+            .do()
+        )
+        items = res.get("data", {}).get("Get", {}).get("Post", []) or []
+        if items:
             candidates.append({
                 "doc_id": doc_id,
-                "text": result.properties.get("text", ""),
+                "text": items[0].get("text", ""),
             })
 
     # Stage 3: cross-encoder re-rank candidates down to k_out
     return cross_encoder_rerank(query, candidates, k_out)
+
+
+def _measure_latency(
+    client: weaviate.Client,
+    query: str,
+    embedder,
+    k_in: int = 50,
+    k_out: int = 5,
+) -> dict:
+    """Run one query through both stages and return timing breakdown in ms."""
+    # Stage 1 timing — hybrid retrieval only
+    t0 = time.perf_counter()
+    candidate_ids = hybrid_search(client, query, k_in, embedder, alpha=0.5)
+    t1 = time.perf_counter()
+    hybrid_ms = (t1 - t0) * 1000
+
+    if not candidate_ids:
+        return {"hybrid_ms": hybrid_ms, "rerank_ms": 0.0, "total_ms": hybrid_ms}
+
+    # Resolve text for each candidate via Weaviate v3 API
+    candidates = []
+    for doc_id in candidate_ids:
+        res = (
+            client.query
+            .get("Post", ["doc_id", "text"])
+            .with_where({
+                "path": ["doc_id"],
+                "operator": "Equal",
+                "valueText": doc_id,
+            })
+            .with_limit(1)
+            .do()
+        )
+        items = res.get("data", {}).get("Get", {}).get("Post", []) or []
+        if items:
+            candidates.append({
+                "doc_id": doc_id,
+                "text": items[0].get("text", ""),
+            })
+
+    # Stage 2 timing — cross-encoder re-ranking only
+    t2 = time.perf_counter()
+    cross_encoder_rerank(query, candidates, k_out)
+    t3 = time.perf_counter()
+    rerank_ms = (t3 - t2) * 1000
+
+    return {
+        "hybrid_ms": hybrid_ms,
+        "rerank_ms": rerank_ms,
+        "total_ms": hybrid_ms + rerank_ms,
+    }
+
+
+def main():
+    """Evaluate the two-stage rerank pipeline and print a results summary."""
+    # --- connect to Weaviate v3 local instance ---
+    client = weaviate.Client("http://localhost:8080")
+    embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+    # --- load eval set ---
+    eval_path = os.path.join("data", "retrieval_eval.jsonl")
+    eval_rows = []
+    with open(eval_path, encoding="utf-8") as f:
+        for line in f:
+            eval_rows.append(json.loads(line))
+
+    print("=" * 50)
+    print(f"Eval set: {len(eval_rows)} queries")
+
+    # --- hybrid baseline metrics ---
+    print("=" * 50)
+    print("Evaluating hybrid baseline...")
+    baseline_hits, baseline_mrr = 0, 0.0
+    for row in eval_rows:
+        top = hybrid_search(client, row["query"], 5, embedder, alpha=0.5)
+        if row["gold_doc_id"] in top:
+            baseline_hits += 1
+            baseline_mrr += 1 / (top.index(row["gold_doc_id"]) + 1)
+    print(f"  recall@5 : {baseline_hits / len(eval_rows):.4f}")
+    print(f"  MRR      : {baseline_mrr / len(eval_rows):.4f}")
+
+    # --- rerank pipeline metrics ---
+    print("=" * 50)
+    print("Evaluating rerank pipeline...")
+    rerank_hits, rerank_mrr = 0, 0.0
+    for row in eval_rows:
+        top = rerank_search(client, row["query"], embedder)
+        if row["gold_doc_id"] in top:
+            rerank_hits += 1
+            rerank_mrr += 1 / (top.index(row["gold_doc_id"]) + 1)
+    print(f"  recall@5 : {rerank_hits / len(eval_rows):.4f}")
+    print(f"  MRR      : {rerank_mrr / len(eval_rows):.4f}")
+
+    # --- per-query latency ---
+    print("=" * 50)
+    print("Measuring per-query latency (5 sample queries)...")
+    sample_queries = [
+        "What is retrieval-augmented generation?",
+        "How does dense retrieval work?",
+        "Explain BM25 scoring",
+        "What are cross-encoders used for?",
+        "How to fine-tune a bi-encoder?",
+    ]
+
+    latencies = [_measure_latency(client, q, embedder) for q in sample_queries]
+    avg_hybrid = np.mean([l["hybrid_ms"] for l in latencies])
+    avg_rerank = np.mean([l["rerank_ms"] for l in latencies])
+    avg_total  = np.mean([l["total_ms"]  for l in latencies])
+
+    print(f"  avg hybrid retrieval : {avg_hybrid:.1f} ms")
+    print(f"  avg cross-encoder    : {avg_rerank:.1f} ms")
+    print(f"  avg total            : {avg_total:.1f} ms")
+    print("=" * 50)
+
+    
+
+
+
+if __name__ == "__main__":
+    main()

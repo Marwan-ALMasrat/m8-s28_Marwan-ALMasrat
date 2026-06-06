@@ -1,4 +1,4 @@
-"""Provided helpers for the integration repo.
+﻿"""Provided helpers for the integration repo.
 
 You implemented these in the lab; reusable copies are provided here so the
 integration focuses on the RAG layer (retrieve -> prompt -> generate) rather
@@ -39,7 +39,7 @@ def index_corpus_if_needed(client: weaviate.Client, corpus_path: str, embedder) 
     skip; otherwise (re)create the schema and ingest.
     """
     expected = 0
-    with open(corpus_path) as f:
+    with open(corpus_path, encoding="utf-8") as f:
         for _ in f:
             expected += 1
 
@@ -56,7 +56,7 @@ def index_corpus_if_needed(client: weaviate.Client, corpus_path: str, embedder) 
     client.schema.create_class(_build_class_definition())
 
     rows: list[dict] = []
-    with open(corpus_path) as f:
+    with open(corpus_path, encoding="utf-8") as f:
         for line in f:
             rows.append(json.loads(line))
 
@@ -112,3 +112,4 @@ def hybrid_search(client: weaviate.Client, query: str, k: int, embedder, alpha: 
     )
     items = res.get("data", {}).get("Get", {}).get(CLASS_NAME, []) or []
     return [it["doc_id"] for it in items]
+
